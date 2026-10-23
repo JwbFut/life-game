@@ -1,0 +1,28 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+/// One generation of the field, one per second, packed at one bit per cell.
+model LifeFrame {
+  t         BigInt   @id
+  bits      Bytes
+  hash      String
+  createdAt DateTime @default(now())
+
+  @@index([hash])
+  @@map("life_frames")
+}
+
+/// Cross-process lease so several nodes never seed or extend the same run.
+model LifeLock {
+  key       String   @id
+  owner     String
+  expiresAt DateTime
+
+  @@map("life_locks")
+}

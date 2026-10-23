@@ -1,0 +1,31 @@
+# dependencies
+node_modules/
+
+# next.js
+.next/
+out/
+*.tsbuildinfo
+next-env.d.ts
+
+# prisma
+src/generated/
+prisma/*.db
+prisma/*.db-journal
+
+# runtime data (sqlite lives here; LIFE_DB_PATH can move it)
+data/
+*.db-wal
+*.db-shm
+
+# env
+.env
+.env.*
+!.env.example
+
+# tooling / logs / os
+.venv/
+__pycache__/
+*.log
+.DS_Store
+.vercel/
+.vercel

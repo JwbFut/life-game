@@ -18,7 +18,7 @@ export const HASH_EVERY = 10;
 export const FRAME_DELAY_CS = 100; // one second per generation
 /** The frozen closing frame lingers, so the end is unmistakable. */
 export const CAPTION_DELAY_CS = 300;
-/** Frames older than a minute are dropped. */
+/** Frames older than a minute are dropped, except the newest one. */
 export const FRAME_TTL_SECONDS = 60;
 /** An encoded GIF is reused for one second. */
 export const GIF_CACHE_MS = 1000;

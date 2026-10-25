@@ -25,14 +25,28 @@ async function readFrame(t: bigint): Promise<Uint8Array<ArrayBuffer> | null> {
     return row ? new Uint8Array(row.bits) : null;
 }
 
-/** Drop anything older than one minute. */
+/**
+ * Drop anything older than one minute, except the newest frame: if the wall
+ * clock jumps, that state is what the next request continues from instead of
+ * starting a new random field.
+ */
 export async function prune(now: bigint): Promise<void> {
-    await prisma.lifeFrame.deleteMany({ where: { t: { lt: now - TTL } } });
+    const newest = await prisma.lifeFrame.findFirst({
+        orderBy: { t: "desc" },
+        select: { t: true },
+    });
+    await prisma.lifeFrame.deleteMany({
+        where: {
+            t: { lt: now - TTL },
+            ...(newest ? { NOT: { t: newest.t } } : {}),
+        },
+    });
 }
 
-async function recentHashes(since: bigint): Promise<Set<string>> {
+/** Hashes of the frames in [since, until], used to detect repeats. */
+async function recentHashes(since: bigint, until: bigint): Promise<Set<string>> {
     const rows = await prisma.lifeFrame.findMany({
-        where: { t: { gte: since } },
+        where: { t: { gte: since, lte: until } },
         select: { hash: true },
     });
     return new Set(rows.map((row) => row.hash));
@@ -77,19 +91,55 @@ function generate(count: number, previous: Uint8Array<ArrayBuffer> | null, first
 }
 
 /**
- * A new chain: generated in memory, then stamped. The timestamps are taken after
- * generation, so the chain starts at the second closest to being readable.
+ * A new run from a random field. Only an empty database needs this: a clock
+ * jump, a long idle gap or a broken window continue the existing run instead.
  */
 async function seed(now: bigint, count: number): Promise<void> {
-    const known = await recentHashes(now - TTL);
-    const frames = generate(count, null, 0n, known);
-    const base = nowSeconds();
-    const data = frames.map((frame, i) => ({ t: base + BigInt(i), bits: frame.bits, hash: frame.hash }));
+    const known = await recentHashes(now - TTL, now - 1n);
+    const frames = generate(count, null, now, known);
+    const data = frames.map((frame, i) => ({ t: now + BigInt(i), bits: frame.bits, hash: frame.hash }));
 
     await prisma.$transaction([
-        prisma.lifeFrame.deleteMany({ where: { t: { gte: base } } }),
+        prisma.lifeFrame.deleteMany({ where: { t: { gte: now } } }),
         prisma.lifeFrame.createMany({ data }),
     ]);
+}
+
+/**
+ * Continue the run at `now` from the newest stored state. The first generated
+ * frame is the next generation, so a clock jump or a hole moves the field
+ * forward instead of starting a random one. Returns false only for an empty db.
+ *
+ * The frame at `now - 1` is preferred for a hole in the served window: playing
+ * the chain forward from there reproduces the missing second. When the clock
+ * jumped, no frame reaches this moment and the newest frame is used instead.
+ */
+async function reanchor(now: bigint, count: number): Promise<boolean> {
+    let row = await prisma.lifeFrame.findFirst({
+        where: { t: { lt: now } },
+        orderBy: { t: "desc" },
+        select: { bits: true },
+    });
+    if (!row) {
+        // A backwards clock step can leave only future frames: continue from
+        // the newest one rather than seeding.
+        row = await prisma.lifeFrame.findFirst({
+            orderBy: { t: "desc" },
+            select: { bits: true },
+        });
+    }
+    if (!row) {
+        return false;
+    }
+    const known = await recentHashes(now - TTL, now - 1n);
+    const frames = generate(count, new Uint8Array(row.bits), now, known);
+    const data = frames.map((frame, i) => ({ t: now + BigInt(i), bits: frame.bits, hash: frame.hash }));
+
+    await prisma.$transaction([
+        prisma.lifeFrame.deleteMany({ where: { t: { gte: now } } }),
+        prisma.lifeFrame.createMany({ data }),
+    ]);
+    return true;
 }
 
 /** Continues the chain from `last` up to `end` (exclusive). */
@@ -98,7 +148,7 @@ async function extend(now: bigint, last: bigint, end: bigint): Promise<void> {
     if (!previous) {
         return;
     }
-    const known = await recentHashes(now - TTL);
+    const known = await recentHashes(now - TTL, last);
     const frames = generate(Number(end - last - 1n), previous, last + 1n, known);
     if (frames.length === 0) {
         return;
@@ -142,8 +192,8 @@ const LOCK_KEY = "run";
  * One request does one unit of work, at most BUDGET_FRAMES new frames:
  * - the chain must cover [now, now + 180), otherwise it is completed under lease;
  * - when it does, the tail is pushed towards now + CHAIN_FRAMES, same lease.
- * The window is always re-read after the lease is released work, never trusted
- * from before it: another node may have re-seeded it in between.
+ * The window is always re-read under the lease, never trusted from before it:
+ * another node may have re-seeded it in between.
  */
 async function ensure(now: bigint): Promise<bigint> {
     const target = now + CHAIN;
@@ -162,11 +212,15 @@ async function ensure(now: bigint): Promise<bigint> {
                 let start = await readyStart(now);
                 const last = await tail(now);
                 if (start === null || last === null || last + 1n < target) {
-                    // `tail` already means "a frame at now - 1 or later": when it is
-                    // null nothing reaches this moment and the chain is restarted.
-                    // A detected loop is handled inside generation (blank + fresh).
+                    // `tail` means "a frame at now - 1 or later": when it is null
+                    // the clock jumped, the chain idled out, or the db is empty.
+                    // Keep the run going from the newest state; only an empty db
+                    // gets a fresh random field. A detected loop is handled inside
+                    // generation (blank + fresh).
                     if (last === null) {
-                        await seed(now, BUDGET_FRAMES);
+                        if (!(await reanchor(now, BUDGET_FRAMES))) {
+                            await seed(now, BUDGET_FRAMES);
+                        }
                     } else {
                         const stop =
                             target < last + 1n + BUDGET ? target : last + 1n + BUDGET;
@@ -176,8 +230,11 @@ async function ensure(now: bigint): Promise<bigint> {
                     }
                     start = await readyStart(now);
                     if (start === null) {
-                        // A hole the tail cannot fill: rebuild the chain.
-                        await seed(now, BUDGET_FRAMES);
+                        // A hole the tail cannot fill: continue from the newest
+                        // state at `now` instead of rebuilding a random chain.
+                        if (!(await reanchor(now, BUDGET_FRAMES))) {
+                            await seed(now, BUDGET_FRAMES);
+                        }
                         start = await readyStart(now);
                     }
                 }

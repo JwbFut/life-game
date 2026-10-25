@@ -14,12 +14,13 @@ A Conway's Game of Life field as an API. One generation per second, two palettes
 
 - Frames are keyed by epoch second. The chain holds 180 future frames and never
   runs past `now + 360`; one request generates at most 180 new ones.
-- A new chain is seeded only when the previous second (`now - 1`) has no frame, or
-  when no servable window can be built; otherwise generation always continues
-  from the tail.
+- The run is only ever restarted by the loop breaker below. On a clock jump, a
+  long idle gap or a hole in the served window the field continues from the
+  newest stored state (re-stamped at `now`); a fresh random field is seeded only
+  for an empty database. The newest frame is kept even after it leaves the 60 s
+  window so a jump still has a state to continue from.
 - Generation takes a lease row in `life_locks`, so several nodes never seed the
-  same second — losers wait for the winner. Timestamps are stamped after
-  generation; anything older than 60 s is pruned.
+  same second — losers wait for the winner. Anything older than 60 s is pruned.
 - Every 10 frames the state is hashed; a repeat inserts a blank frame and
   re-seeds.
 - `LIFE` is ink, not cells: its box is masked out of the simulation.
